@@ -27,16 +27,13 @@
 #include "postmaster/syslogger.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
-#if PG_VERSION_NUM >= 140000
-#include "utils/backend_status.h"
-#endif
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/ps_status.h"
 
-#if PG_VERSION_NUM < 90600
-#error Minimum version of PostgreSQL required is 9.6
+#if PG_VERSION_NUM < 90400
+#error Minimum version of PostgreSQL required is 9.4
 #endif
 
 /* Allow load of this module in shared libs */
@@ -119,47 +116,56 @@ jsonlog_error_severity(int elevel)
  * elog.c and simplified as in this case everything is sent to stderr.
  */
 static void
-jsonlog_write_pipe_chunks(char *data, int len)
+jsonlog_write_pipe_chunks(char *data, int len, int dest)
 {
-	PipeProtoChunk	p;
-	int				fd = fileno(stderr);
-	int				rc;
+    PipeProtoChunk p;
+	int			fd = fileno(stderr);
+    int			rc;
 
 	Assert(len > 0);
 
-	p.proto.nuls[0] = p.proto.nuls[1] = '\0';
-	p.proto.pid = MyProcPid;
-
-#if PG_VERSION_NUM >= 150000
-	p.proto.flags = PIPE_PROTO_DEST_STDERR;
-#endif
+	p.hdr.zero = 0;
+	p.hdr.pid = MyProcPid;
+	p.hdr.thid = mythread();
+	p.hdr.main_thid = mainthread();
+	p.hdr.chunk_no = 0;
+	p.hdr.log_format = (dest == LOG_DESTINATION_CSVLOG ? 'c' : 't');
+	p.hdr.is_segv_msg = 'f';
+	p.hdr.next = -1;
 
 	/* write all but the last chunk */
 	while (len > PIPE_MAX_PAYLOAD)
 	{
-#if PG_VERSION_NUM >= 150000
-		/*  no need to set PIPE_PROTO_IS_LAST yet */
-#else
-		p.proto.is_last = 'f';
+		p.hdr.is_last = 'f';
+		p.hdr.len = PIPE_MAX_PAYLOAD;
+		memcpy(p.data, data, PIPE_MAX_PAYLOAD);
+
+#ifdef USE_ASSERT_CHECKING
+				Assert(p.hdr.zero == 0);
+				Assert(p.hdr.pid != 0);
+				Assert(p.hdr.thid != 0);
 #endif
-		p.proto.len = PIPE_MAX_PAYLOAD;
-		memcpy(p.proto.data, data, PIPE_MAX_PAYLOAD);
-		rc = write(fd, &p, PIPE_HEADER_SIZE + PIPE_MAX_PAYLOAD);
-		(void) rc;
-		data += PIPE_MAX_PAYLOAD;
+        rc = write(fd, &p, PIPE_CHUNK_SIZE);
+        (void) rc;
+        data += PIPE_MAX_PAYLOAD;
 		len -= PIPE_MAX_PAYLOAD;
+
+		++p.hdr.chunk_no;
 	}
 
 	/* write the last chunk */
-#if PG_VERSION_NUM >= 150000
-	p.proto.flags |= PIPE_PROTO_IS_LAST;
-#else
-	p.proto.is_last = 't';
+	p.hdr.is_last = 't';
+	p.hdr.len = len;
+
+#ifdef USE_ASSERT_CHECKING
+		Assert(p.hdr.zero == 0);
+		Assert(p.hdr.pid != 0);
+		Assert(p.hdr.thid != 0);
+		Assert(PIPE_HEADER_SIZE + len <= PIPE_CHUNK_SIZE);
 #endif
-	p.proto.len = len;
-	memcpy(p.proto.data, data, len);
-	rc = write(fd, &p, PIPE_HEADER_SIZE + len);
-	(void) rc;
+	memcpy(p.data, data, len);
+    rc = write(fd, &p, PIPE_HEADER_SIZE + len);
+    (void) rc;
 }
 
 /*
@@ -462,34 +468,6 @@ jsonlog_write_json(ErrorData *edata)
 		appendJSONLiteral(&buf, "application_name",
 						  application_name, true);
 
-#if PG_VERSION_NUM >= 130000
-	/* backend type */
-	if (MyProcPid == PostmasterPid)
-		appendJSONLiteral(&buf, "backend_type", "postmaster", true);
-	else if (MyBackendType == B_BG_WORKER)
-		appendJSONLiteral(&buf, "backend_type", MyBgworkerEntry->bgw_type, true);
-	else
-		appendJSONLiteral(&buf, "backend_type", GetBackendTypeDesc(MyBackendType), true);
-#endif
-
-	/* leader PID */
-	if (MyProc)
-	{
-		PGPROC     *leader = MyProc->lockGroupLeader;
-
-		/*
-		 * Show the leader only for active parallel workers.  This leaves out
-		 * the leader of a parallel group.
-		 */
-		if (leader && leader->pid != MyProcPid)
-			appendStringInfo(&buf, "\"leader_pid\":%d,", leader->pid);
-	}
-
-#if PG_VERSION_NUM >= 140000
-	/* query id */
-	appendStringInfo(&buf, "\"query_id\":%lld,", (long long) pgstat_get_my_query_id());
-#endif
-
 	/* Error message */
 	appendJSONLiteral(&buf, "message", edata->message, false);
 
@@ -500,22 +478,14 @@ jsonlog_write_json(ErrorData *edata)
 	/* Write to stderr, if enabled */
 	if ((Log_destination & LOG_DESTINATION_STDERR) != 0)
 	{
-#if PG_VERSION_NUM >= 130000
-		if (redirection_done && MyBackendType != B_LOGGER)
-#else
 		if (redirection_done && !am_syslogger)
-#endif
-			jsonlog_write_pipe_chunks(buf.data, buf.len);
+			jsonlog_write_pipe_chunks(buf.data, buf.len, LOG_DESTINATION_STDERR);
 		else
 			jsonlog_write_console(buf.data, buf.len);
 	}
 
 	/* If in the syslogger process, try to write messages direct to file */
-#if PG_VERSION_NUM >= 130000
-	if (MyBackendType == B_LOGGER)
-#else
 	if (am_syslogger)
-#endif
 		write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_STDERR);
 
 	/* Cleanup */
